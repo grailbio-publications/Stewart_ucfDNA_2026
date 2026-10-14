@@ -1,0 +1,887 @@
+---
+title: "`r params$rmd_title`"
+subtitle: "`r params$rmd_subtitle`"
+author: "`r params$rmd_author`"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  # These will be updated by bazel - do not change by hand.
+  rmd_title: "Urine Manuscript Analysis"
+  rmd_subtitle: "complete"
+  rmd_author: "Yinjie Gao"
+  output_dir: "~"
+  # Other params
+  # Path is relative to this Rmd (Rmd/), so the default points at ../data/.
+  data_file: "../data/urine_cfdna_manuscript_data_20261014.xlsx"
+  figure_format: "png"
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  tidy = FALSE,
+  results = "asis",
+  fig.width = 6,
+  fig.height = 4,
+  fig.align = "left",
+  dev = params$figure_format
+)
+
+requireNamespace("patchwork")
+requireNamespace("gtsummary")
+requireNamespace("pROC")
+requireNamespace("ggnewscale")
+requireNamespace("ggh4x")
+requireNamespace("CIfinder")
+
+set_font <- list(
+  ggplot2::theme(strip.text = ggplot2::element_text(size = 12),
+                 axis.title = ggplot2::element_text(size = 11),
+                 axis.text = ggplot2::element_text(size = 10),
+                 legend.title = ggplot2::element_text(size = 10),
+                 legend.text = ggplot2::element_text(size = 10),
+                 legend.box.background = ggplot2::element_rect(color = "black", linewidth = 0.25))
+)
+ggplot2::theme_set(ggplot2::theme_bw() + set_font)
+```
+
+```{r load_data}
+# Load the analysis-ready, de-identified Excel workbook (see data/ and README.md).
+df_clinical <- openxlsx::read.xlsx(params$data_file, sheet = "Clinical Data")
+df_sample   <- openxlsx::read.xlsx(params$data_file, sheet = "Sample Data")
+
+df_master <- df_clinical |>
+  dplyr::inner_join(df_sample, by = "participant_id") |>
+  dplyr::mutate(
+    biofluid = factor(biofluid, levels = c("urine", "plasma")),
+    biobank = factor(biobank, levels = c("UCSD", "MGB")),
+    cohort = factor(cohort, levels = c("UCSD Training", "MGB Holdout (Baseline)",
+                                       "UCSD Holdout (Pre-Surgery)", "MGB Holdout (Pre-Surgery)",
+                                       "UCSD Holdout (Surveillance)")),
+    cancer_status = factor(cancer_status,
+                           levels = c("Non-Cancer/Benign", "Bladder Cancer/UTUC")),
+    cancer_type = factor(cancer_type, levels = c("Non-Cancer", "Benign",
+                                                 "BC", "NMIBC", "MIBC", "UTUC")),
+    grade = factor(grade, levels = c("Low Grade", "High Grade")),
+    tstage = factor(tstage, levels = c("T0", "Tis", "Ta", "T1", "T1a", "T1b",
+                                       "T2", "T2a", "T2b", "T3", "T3a", "T3b",
+                                       "T4", "T4a", "T4b")),
+    tstage_surgery = factor(tstage_surgery, levels = c("T0", "Tis", "Ta", "T1", "T1a", "T1b",
+                                                       "T2", "T2a", "T2b", "T3", "T3a", "T3b",
+                                                       "T4", "T4a", "T4b"))
+  )
+
+baseline_filter <- function(df) {
+  df |> dplyr::filter(cohort %in% c("UCSD Training", "MGB Holdout (Baseline)"))
+}
+urine_baseline_filter <- function(df) {
+  df |> baseline_filter() |> dplyr::filter(biofluid == "urine")
+}
+urine_training_filter <- function(df) {
+  df |> dplyr::filter(cohort == "UCSD Training", biofluid == "urine")
+}
+
+format_pct_stat <- function(n1, n2, method = "wilson", accuracy = 1) {
+  stat <- n1 / n2
+  ci <- DescTools::BinomCI(n1, n2, method = method)[2:3]
+  return(list(pct = stat,
+              pct_lci = ci[1],
+              pct_uci = ci[2],
+              label = sprintf("%s (%s/%s)", scales::percent(stat, accuracy = accuracy), n1, n2),
+              label_ci = sprintf("%s (%s/%s) [%s-%s]", scales::percent(stat, accuracy = accuracy),
+                                 n1, n2, scales::percent(ci[1], accuracy = accuracy),
+                                 scales::percent(ci[2], accuracy = accuracy))))
+}
+
+summarise_pcr_perf <- function(df, binary_col = "cancer_detected") {
+  df |>
+    dplyr::mutate(binary_call = .data[[binary_col]]) |>
+    dplyr::summarise(
+      n_tp = sum(pcr_status == "No-pCR" & binary_call, na.rm = TRUE),
+      n_fp = sum(pcr_status == "pCR" & binary_call, na.rm = TRUE),
+      n_tn = sum(pcr_status == "pCR" & !binary_call, na.rm = TRUE),
+      n_fn = sum(pcr_status == "No-pCR" & !binary_call, na.rm = TRUE),
+    ) |>
+    dplyr::rowwise() |>
+    dplyr::mutate(
+      Sensitivity = format_pct_stat(n_tp, n_tp + n_fn)$label_ci,
+      Specificity = format_pct_stat(n_tn, n_tn + n_fp)$label_ci,
+      PPV = format_pct_stat(n_tp, n_tp + n_fp)$label_ci,
+      NPV = format_pct_stat(n_tn, n_tn + n_fn)$label_ci,
+    )
+}
+```
+
+```{r derive_subsets}
+# QC-passed, one row per participant x biofluid
+df_evaluable <- df_master |>
+  dplyr::filter(qc_pass) |>
+  dplyr::arrange(cancer_detected) |>
+  dplyr::distinct(participant_id, biofluid, .keep_all = TRUE)
+
+# Baseline cohorts with BC/NMIBC collapsed
+df_baseline <- df_evaluable |>
+  baseline_filter() |>
+  dplyr::mutate(cancer_type = forcats::fct_collapse(cancer_type, BC = c("BC", "NMIBC")))
+
+# Surveillance dataset (intervals pre-computed in data notebook)
+df_surv <- df_evaluable |>
+  dplyr::filter(cohort == "UCSD Holdout (Surveillance)")
+
+# Pre-Surgery dataset (wide: one row per participant, urine + plasma columns)
+df_pcr <- df_evaluable |>
+  dplyr::filter(grepl("Pre-Surgery", cohort)) |>
+  dplyr::select(participant_id, biobank, cancer_type, age, sex,
+                tstage, tstage_surgery, tnm_surgery, pcr_status,
+                had_neoadjuvant_therapy) |>
+  dplyr::distinct(participant_id, .keep_all = TRUE) |>
+  dplyr::left_join(
+    df_evaluable |>
+      dplyr::filter(grepl("Pre-Surgery", cohort), biofluid == "urine") |>
+      dplyr::select(participant_id, median_tmef, cancer_detected, cancer_score)
+  ) |>
+  dplyr::left_join(
+    df_evaluable |>
+      dplyr::filter(grepl("Pre-Surgery", cohort), biofluid == "plasma") |>
+      dplyr::select(participant_id, median_tmef, cancer_detected, cancer_score),
+    by = "participant_id", suffix = c("_urine", "_plasma")
+  ) |>
+  dplyr::mutate(
+    cancer_type = forcats::fct_drop(cancer_type),
+    cancer_detected_urine_or_plasma = cancer_detected_urine | cancer_detected_plasma
+  )
+```
+
+```{r plot_aes}
+fill_urine_ctdna <- list(
+  ggplot2::scale_fill_manual(name = "Urine ctDNA Status", guide = ggplot2::guide_legend(order = 3),
+                             values = c(`TRUE` = "#D29A22", `FALSE` = "white"),
+                             labels = c(`TRUE` = "Positive", `FALSE` = "Negative"))
+)
+fill_plasma_ctdna <- list(
+  ggplot2::scale_fill_manual(name = "Plasma ctDNA Status", guide = ggplot2::guide_legend(order = 4),
+                             values = c(`TRUE` = "#B73D27", `FALSE` = "white"),
+                             labels = c(`TRUE` = "Positive", `FALSE` = "Negative"))
+)
+biofluid_color <- list(
+  ggplot2::scale_color_manual(NULL, values = c("urine" = "#D29A22", "plasma" = "#B73D27"),
+                              labels = c(`urine` = "Urine", `plasma` = "Plasma"))
+)
+biobank_shape <- list(ggplot2::scale_shape_manual(NULL, values = c(21, 23),
+                                                  guide = ggplot2::guide_legend(order = 1)))
+cohort_color <- list(ggplot2::scale_color_manual(NULL, values = c("#243157", "#6c1322"),
+                                                 guide = ggplot2::guide_legend(order = 1)))
+cohort_fill <- list(ggplot2::scale_fill_manual(NULL, values = c("#243157", "#6c1322"),
+                                               guide = ggplot2::guide_legend(order = 1)))
+
+detection_shape <- list(ggplot2::scale_shape_manual("Classifier Preditcion", values = c(1, 19),
+                                                    labels = c("Negative", "Positive")))
+grade_fill <- list(
+  ggplot2::scale_fill_manual("Tumor Grade",
+                             values = c("Low Grade" = "#628592", "High Grade" = "#58508D"))
+)
+grade_color <- list(
+  ggplot2::scale_color_manual("Tumor Grade",
+                              values = c("Low Grade" = "#628592", "High Grade" = "#58508D"))
+)
+```
+
+# Cohort Overview
+## Patient Enrolled
+```{r table_cohort_overview}
+df_master |>
+  dplyr::left_join(df_master |>
+                     dplyr::filter(biofluid == "urine") |>
+                     dplyr::distinct(participant_id, urine_evaluable = qc_pass)) |>
+  dplyr::left_join(df_master |>
+                     dplyr::filter(biofluid == "plasma") |>
+                     dplyr::distinct(participant_id, plasma_evaluable = qc_pass)) |>
+  dplyr::distinct(participant_id, .keep_all = TRUE) |>
+  dplyr::mutate(cancer_type = as.character(cancer_type)) |>
+  dplyr::mutate_at(c("cohort", "tstage"), forcats::fct_drop) |>
+  gtsummary::tbl_strata(
+    strata = cohort,
+    .tbl_fun =
+      ~ .x |>
+      gtsummary::tbl_summary(
+        by = cancer_type,
+        include = c(urine_evaluable, plasma_evaluable, sex, age, grade, tstage),
+        label = list(sex = "Sex",
+                     age = "Age",
+                     cancer_type = "Cancer Status and Type",
+                     grade = "Tumor Grade",
+                     tstage = "TStage"),
+        missing = "no"
+      ) |>
+      gtsummary::modify_caption("**Cohort Characteristics**")
+  )
+```
+
+## QC summary
+```{r table_qc_summary}
+df_master |>
+  dplyr::mutate(biofluid = as.character(biofluid)) |>
+  gtsummary::tbl_strata(
+    strata = cohort,
+    .tbl_fun =
+      ~ .x |>
+      gtsummary::tbl_summary(
+        by = biofluid,
+        include = c(qc_pass, qc_issue),
+        missing = "no",
+        label = list(qc_pass = "QC Pass",
+                     qc_issue = "QC Failure Reason:")
+      )
+  )
+```
+
+```{r urine_qc_failed}
+df_master |>
+  dplyr::filter(biofluid == "urine",
+                !qc_pass) |>
+  dplyr::mutate(cancer_type = as.character(cancer_type)) |>
+  dplyr::mutate_at(c("cohort", "tstage"), forcats::fct_drop) |>
+  gtsummary::tbl_strata(
+    strata = cohort,
+    .tbl_fun =
+      ~ .x |>
+      gtsummary::tbl_summary(
+        by = cancer_type,
+        include = c(qc_issue, sex, grade, tstage),
+        label = list(sex = "Sex",
+                     cancer_type = "Cancer Status and Type",
+                     grade = "Tumor Grade",
+                     tstage = "TStage",
+                     qc_issue = "QC Failure Reason"),
+        missing = "no"
+      ) |>
+      gtsummary::modify_caption("**Urine QC failed sample characteristics**")
+  )
+```
+
+
+# Assay Output
+UCSD baseline samples, including QC failed
+
+```{r figure_assay_training, fig.width = 11, fig.height = 3}
+ls_assay_metric <- list(
+  "cfdna_concentration" = "cfDNA Concentration (ng/ml)",
+  "cfdna_yield" = "cfDNA Yield (ng)",
+  "analysis_filtered_fragment_lengths_stats_mean" = "Mean Fragment Length"
+)
+
+ls_fig_assay <- ls_assay_metric |>
+  purrr::imap(function(metric, metric_col) {
+    pl <- df_master |>
+      dplyr::filter(cohort == "UCSD Training") |>
+      dplyr::mutate(cancer_status = forcats::fct_recode(
+        cancer_status,
+        "Non-Cancer/\nBenign" = "Non-Cancer/Benign",
+        "Bladder Cancer/\nUTUC" = "Bladder Cancer/UTUC"
+      )) |>
+      ggplot2::ggplot(ggplot2::aes_string(x = "cancer_status", y = metric_col,
+                                          color = "biofluid")) +
+      ggplot2::geom_boxplot(outlier.shape = NA) +
+      ggplot2::geom_jitter(size = 1, shape = 1, position = ggplot2::position_jitterdodge()) +
+      ggplot2::labs(x = "", y = metric) + biofluid_color
+    if (metric_col %in% c("cfdna_yield", "cfdna_concentration")) {
+      pl <- pl +
+        ggplot2::scale_y_continuous(trans = "log10", breaks = 10^seq(0, 4),
+                                    labels = c(1, 10, 100, as.expression(bquote(10^3)),
+                                         as.expression(bquote(10^4)))) +
+        ggplot2::annotation_logticks(sides = "l")
+    }
+    return(pl)
+  })
+
+patchwork::wrap_plots(ls_fig_assay, guides = "collect", nrow = 1) +
+  patchwork::plot_annotation(tag_levels = 'A') +
+  patchwork::plot_layout(guides = "collect")
+```
+
+```{r}
+assay_stat <- function(df, col_by) {
+  df |> gtsummary::tbl_summary(
+    by = col_by,
+    include = c(cfdna_concentration, cfdna_yield,
+                analysis_on_binary_target_coverage_stats_mean,
+                analysis_filtered_fragment_lengths_stats_mean),
+    label = ls_assay_metric,
+    digits = gtsummary::all_continuous() ~ 1,
+    statistic = list(c(cfdna_concentration, cfdna_yield) ~
+                       "{median} ({p25}, {p75}) [{min}, {max}]",
+                     c(analysis_on_binary_target_coverage_stats_mean,
+                       analysis_filtered_fragment_lengths_stats_mean) ~
+                       "{mean} ({sd})")
+  )
+}
+df_master |>
+  dplyr::filter(cohort == "UCSD Training") |>
+  dplyr::arrange(participant_id, biofluid) |>
+  dplyr::mutate(.by = biofluid, id = dplyr::row_number()) |>
+  dplyr::filter(.by = id, dplyr::n() == 2) |>
+  assay_stat("biofluid") |>
+  gtsummary::add_p(test = list(
+    c(cfdna_concentration, cfdna_yield) ~ "paired.wilcox.test",
+    c(analysis_on_binary_target_coverage_stats_mean,
+      analysis_filtered_fragment_lengths_stats_mean) ~ "paired.t.test"),
+    group = id) |>
+  gtsummary::modify_caption("UCSD Training Assay Stats: by Biofluid")
+
+df_master |>
+  dplyr::filter(cohort == "UCSD Training") |>
+  gtsummary::tbl_strata(
+    strata = cancer_status,
+    .tbl_fun =
+      ~ .x |>
+      dplyr::arrange(participant_id, biofluid) |>
+      dplyr::mutate(.by = biofluid, id = dplyr::row_number()) |>
+      dplyr::filter(.by = id, dplyr::n() == 2) |>
+      assay_stat("biofluid") |>
+      gtsummary::add_p(test = list(
+        c(cfdna_concentration, cfdna_yield) ~ "paired.wilcox.test",
+        c(analysis_on_binary_target_coverage_stats_mean,
+          analysis_filtered_fragment_lengths_stats_mean) ~ "paired.t.test"),
+        group = id)
+  ) |>
+  gtsummary::modify_caption("UCSD Training Assay Stats: by Biofluid among Cancer/Non-cancer")
+```
+
+```{r}
+df_master |>
+  urine_baseline_filter() |>
+  gtsummary::tbl_strata(
+    strata = cohort,
+    .tbl_fun =
+      ~ .x |>
+      assay_stat("cancer_status") |>
+      gtsummary::add_p() |>
+      gtsummary::add_overall()
+  ) |>
+  gtsummary::modify_caption("Baseline Urine Samples Assay Stats: By Cancer Status")
+```
+
+# TMeF of Baseline Samples
+UCSD baseline samples (training)
+
+```{r figure_tmef, fig.height = 2.5, fig.width = 5}
+format_tmef_plt <- list(
+  ggplot2::labs(x = "", y = "TMeF (PPM)"),
+  ggplot2::scale_y_continuous(trans = "log10", limits = c(1, 5* 10^5), breaks = 10^seq(0, 5),
+                              labels = c("1", "10", "100", as.expression(bquote(10^3)),
+                                         as.expression(bquote(10^4)),
+                                         as.expression(bquote(10^5)))),
+  ggplot2::annotation_logticks(sides = "l")
+)
+df_evaluable |>
+  urine_training_filter() |>
+  ggplot2::ggplot(ggplot2::aes(x = cancer_type, y = median_tmef,
+                               color = grade, fill = grade)) +
+  ggplot2::geom_boxplot(alpha = 0, outlier.alpha = 0) +
+  ggbeeswarm::geom_quasirandom(dodge.width = 0.8, shape = 21) +
+  format_tmef_plt + grade_color + grade_fill
+```
+
+```{r}
+for (c in c("Benign", "BC", "UTUC")) {
+  df_evaluable |>
+    urine_training_filter() |>
+    dplyr::filter(cancer_type %in% c("Non-Cancer", c)) |>
+    dplyr::mutate(cancer_type = forcats::fct_drop(cancer_type)) |>
+    gtsummary::tbl_summary(
+      by = cancer_type,
+      include = c(median_tmef),
+      label = list(median_tmef = "TMeF (PPM)"),
+      type = list(median_tmef ~ "continuous")
+    ) |>
+    gtsummary::add_p() |>
+    print()
+}
+df_evaluable |>
+  urine_training_filter() |>
+  dplyr::filter(cancer_type %in% c("BC")) |>
+  gtsummary::tbl_summary(
+    by = grade,
+    include = c(median_tmef),
+    label = list(median_tmef = "TMeF (PPM)"),
+    type = list(median_tmef ~ "continuous")
+  ) |>
+  gtsummary::add_p()
+```
+
+# Baseline Sensitivity/Specificity
+```{r table_performance}
+summarise_sens_spec <- function(df_sample) {
+  n_tp <- sum(df_sample$cancer_status == "Bladder Cancer/UTUC" & df_sample$cancer_detected)
+  n_fp <- sum(df_sample$cancer_status == "Non-Cancer/Benign" & df_sample$cancer_detected)
+  n_fn <- sum(df_sample$cancer_status == "Bladder Cancer/UTUC" & !df_sample$cancer_detected)
+  n_tn <- sum(df_sample$cancer_status == "Non-Cancer/Benign" & !df_sample$cancer_detected)
+  ls_sensitivity <- format_pct_stat(n_tp, n_tp + n_fn)
+  ls_specificity <- format_pct_stat(n_tn, n_tn + n_fp)
+  data.frame(sensitivity = ls_sensitivity$pct, sensitivity_lci = ls_sensitivity$pct_lci,
+             sensitivity_uci = ls_sensitivity$pct_uci,
+             sensitivity_label = ls_sensitivity$label,
+             sensitivity_label_ci = ls_sensitivity$label_ci,
+             specificity = ls_specificity$pct, specificity_lci = ls_specificity$pct_lci,
+             specificity_uci = ls_specificity$pct_uci,
+             specificity_label = ls_specificity$label,
+             specificity_label_ci = ls_specificity$label_ci)
+}
+
+df_performance <- dplyr::bind_rows(
+  df_baseline |> dplyr::group_by(biofluid, cohort) |>
+    dplyr::group_modify(~summarise_sens_spec(.x), .keep = TRUE) |>
+    dplyr::mutate(cancer_type = "All UC"),
+  df_baseline |> dplyr::filter(cancer_type %in% c("BC", "UTUC")) |>
+    dplyr::mutate(cancer_type = as.character(cancer_type)) |>
+    dplyr::group_by(biofluid, cohort, cancer_type) |>
+    dplyr::group_modify(~summarise_sens_spec(.x), .keep = TRUE),
+  df_baseline |> dplyr::filter(cancer_type %in% c("BC", "UTUC")) |>
+    dplyr::group_by(biofluid, cohort, grade) |>
+    dplyr::group_modify(~summarise_sens_spec(.x), .keep = TRUE) |>
+    dplyr::mutate(cancer_type = "All UC"),
+  df_baseline |> dplyr::filter(cancer_type %in% c("BC", "UTUC")) |>
+    dplyr::mutate(cancer_type = as.character(cancer_type)) |>
+    dplyr::group_by(biofluid, cohort, cancer_type, grade) |>
+    dplyr::group_modify(~summarise_sens_spec(.x), .keep = TRUE)
+) |> dplyr::ungroup()
+
+df_performance |>
+  dplyr::arrange(cohort, cancer_type, grade, biofluid) |>
+  dplyr::select(biofluid, cohort, cancer_type, grade,
+                sensitivity_label_ci, specificity_label_ci) |>
+  gt::gt("Performance in baseline samples")
+```
+
+```{r panel_urine_perf}
+# Plot sensitivity/specificity
+format_sens_plt <- list(
+  ggplot2::geom_point(size = 2, position = ggplot2::position_dodge(width = 0.5)),
+  ggplot2::geom_errorbar(width = 0.2, position = ggplot2::position_dodge(width = 0.5)),
+  ggplot2::geom_text(ggplot2::aes(y = 1.1), position = ggplot2::position_dodge(width = 0.5),
+                     angle = 45, vjust = 0, hjust = 0, size = 3),
+  ggplot2::scale_y_continuous(breaks = seq(0, 1, 0.2), labels = scales::percent),
+  ggplot2::labs(y = "Sensitivity", x = ""),
+  ggplot2::coord_cartesian(ylim = c(0, 1), clip = "off"),
+  ggplot2::theme(plot.margin = ggplot2::margin(50, 20, 0, 0)),
+  cohort_color, cohort_fill,
+  ggplot2::theme(legend.position = "none")
+)
+
+# Specificity
+plt_spec <- df_performance |>
+  dplyr::filter(cancer_type == "All UC", !is.na(specificity), biofluid == "urine") |>
+  ggplot2::ggplot(ggplot2::aes(x = cohort, y = specificity, ymin = specificity_lci,
+                               ymax = specificity_uci, label = specificity_label,
+                               color = cohort, fill = cohort)) +
+  format_sens_plt +
+  ggplot2::labs(y = "Specificity")
+
+# Sensitivity by cancer type
+plt_sens_cancer_type <- df_performance |>
+  dplyr::filter(cancer_type != "All UC", biofluid == "urine") |>
+  dplyr::mutate(cancer_type = factor(cancer_type, levels = c("BC", "UTUC"))) |>
+  dplyr::filter(is.na(grade)) |>
+  ggplot2::ggplot(ggplot2::aes(x = cancer_type, y = sensitivity, ymin = sensitivity_lci,
+                               ymax = sensitivity_uci, label = sensitivity_label,
+                               color = cohort, fill = cohort)) +
+  format_sens_plt
+
+# Sensitivity by grade
+plt_sens_grade <- df_performance |>
+  dplyr::filter(!is.na(grade), cancer_type != "All UC", biofluid == "urine") |>
+  dplyr::mutate(cancer_type = factor(cancer_type, levels = c("BC", "UTUC"))) |>
+  ggplot2::ggplot(ggplot2::aes(x = cancer_type, y = sensitivity, ymin = sensitivity_lci,
+                               ymax = sensitivity_uci, label = sensitivity_label,
+                               color = cohort, fill = cohort)) +
+  format_sens_plt +
+  ggplot2::facet_wrap("grade", strip.position = "right") +
+  ggplot2::theme(legend.position = "right")
+```
+```{r tmef_holdout}
+plt_tmef_holdout <- df_baseline |>
+  dplyr::filter(cohort == "MGB Holdout (Baseline)") |>
+  ggplot2::ggplot(ggplot2::aes(x = cancer_type, y = median_tmef,
+                               color = grade, fill = grade)) +
+  ggbeeswarm::geom_quasirandom(dodge.width = 0.8, size = 1) +
+  ggplot2::geom_boxplot(alpha = 0, outlier.alpha = 0) +
+  ggplot2::facet_wrap("cohort") +
+  format_tmef_plt + grade_color + grade_fill  +
+  ggplot2::guides(shape = "none") +
+  ggplot2::theme(legend.position = c(0.85, 0.2))
+```
+
+```{r figure_performance, fig.width = 9, fig.height = 8}
+ggplot2::theme_set(ggplot2::theme_bw() + set_font + ggplot2::theme(legend.position = "bottom"))
+patchwork::free(plt_sens_cancer_type, side = "l") +
+  patchwork::free(plt_sens_grade, side = "l") +
+  patchwork::free(plt_tmef_holdout, side = "l") +
+  patchwork::guide_area() +
+  patchwork::plot_annotation(tag_levels = 'A') +
+  patchwork::plot_layout(guides = "collect", design = c(
+    patchwork::area(t = 1, b = 4, l = 1, r = 5),
+    patchwork::area(t = 1, b = 4, l = 6, r = 10),
+    patchwork::area(t = 5, b = 8, l = 1, r = 10),
+    patchwork::area(t = 9, b = 10, l = 1, r = 10)
+  ))
+```
+
+# UCSD Surveillance
+
+## Performance in predicting recurrence
+```{r}
+df_surv |>
+  gtsummary::tbl_summary(
+    by = recurrence_status_bsl,
+    include = c(cancer_detected, cysto_result, cytology_result, path_bsl)
+  )
+
+format_ppv_npv <- function(ci_result, caption = "PPV / NPV") {
+  data.frame(
+    Metric = c("PPV", "NPV"),
+    Estimate = scales::percent(c(ci_result$ppv["ppv_est"], ci_result$npv["npv_est"]),
+                               accuracy = 0.1),
+    `95% CI` = c(
+      sprintf("[%s, %s]",
+              scales::percent(ci_result$ppv["ppv_l"], accuracy = 0.1),
+              scales::percent(ci_result$ppv["ppv_u"], accuracy = 0.1)),
+      sprintf("[%s, %s]",
+              scales::percent(ci_result$npv["npv_l"], accuracy = 0.1),
+              scales::percent(ci_result$npv["npv_u"], accuracy = 0.1))
+    ), check.names = FALSE
+  ) |> gt::gt(caption = caption)
+}
+
+CIfinder::ppv_npv_ci(
+  sum(df_surv$recurrence_status_bsl == "Recurrence+" & df_surv$cancer_detected),
+  sum(df_surv$recurrence_status_bsl == "Recurrence+"),
+  sum(df_surv$recurrence_status_bsl == "Recurrence-" & (!df_surv$cancer_detected)),
+  sum(df_surv$recurrence_status_bsl == "Recurrence-"),
+  sum(df_surv$recurrence_status_bsl == "Recurrence+") / nrow(df_surv)) |>
+  format_ppv_npv("Surveillance: PPV / NPV")
+```
+
+## Tileplot
+```{r figure_surveillance_tile, fig.width = 12, fig.height = 2.8}
+df_surv |>
+  dplyr::arrange(desc(cancer_detected)) |>
+  dplyr::mutate(id = forcats::fct_inorder(participant_id),
+                recurrence_status_bsl = factor(recurrence_status_bsl,
+                                               levels = c("Recurrence+", "Recurrence-")),
+                biopsy_benign_bsl = path_bsl == "benign") |>
+  ggplot2::ggplot() +
+  # Cancer detection tile
+  ggplot2::geom_tile(ggplot2::aes(x = id, y = 1, fill = cancer_detected), color = "gray40") +
+  fill_urine_ctdna +
+  ggnewscale::new_scale_fill() +
+  # Other test
+  ggplot2::geom_tile(ggplot2::aes(x = id, y = 2, fill = cysto_result), color = "gray40") +
+    ggplot2::scale_fill_manual(
+      "Cystoscopy", breaks = c("Suspicious Lesion", "No Suspicious Lesion"),
+      values = c("Suspicious Lesion" = "#D67500", "No Suspicious Lesion" = "white"),
+      guide = ggplot2::guide_legend(order = 2)
+  ) +
+  ggnewscale::new_scale_fill() +
+  ggplot2::geom_tile(ggplot2::aes(x = id, y = 3, fill = cytology_result), color = "gray40") +
+  ggplot2::scale_fill_manual(
+    "Cytology", breaks = c("HGUC", "Suspicious", "AUC", "Negative"),
+    values = c("HGUC" = "#602B5B", "Suspicious" = "#B68CB8", "AUC" = "#EFBDEB",
+               "Negative" = "white"),
+      guide = ggplot2::guide_legend(order = 1)
+  ) +
+  ggplot2::geom_text(ggplot2::aes(x = id, y = 0.3, label = path_bsl, color = biopsy_benign_bsl),
+                     angle = 90, vjust = 0.5, hjust = 1, size = 3) +
+  ggplot2::scale_color_manual("Biopsy", values = c("#D54F9C", "#1756A7"),
+                              labels = c("Cancer", "Benign"),
+                              guide = ggplot2::guide_legend(order = 3)) +
+  ggplot2::scale_y_continuous(breaks = c(3, 2, 1, -0.5),
+                              labels = c("Cytology", "Cystoscopy", "Urine ctDNA", "Biopsy")) +
+  ggplot2::facet_grid(cols = ggplot2::vars(recurrence_status_bsl),
+                      scales = "free", space = "free") +
+  ggplot2::coord_cartesian(clip = "off", ylim = c(3.5, -1)) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_blank(), axis.ticks.x = ggplot2::element_blank(),
+                 axis.title.x = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
+                 axis.text.y = ggplot2::element_text(face = "bold"),
+                 axis.title.y = ggplot2::element_blank(),
+                 panel.grid = ggplot2::element_blank(),
+                 legend.position = "bottom", legend.direction = "vertical",
+                 legend.box.background = ggplot2::element_rect(color = "black", linewidth = 0.5),
+                 strip.background = ggh4x::element_part_rect(side = "b", color = "black"),
+                 strip.placement = "outside",
+                 strip.text = ggplot2::element_text(size = 12, face = "bold"))
+```
+
+## Survival Plot
+```{r figure_surveillance_rfs, fig.width = 7, fig.height = 5}
+fit <- survminer::surv_fit(survival::Surv(rfs_interval, rfs_status) ~ cancer_detected,
+                           data =  df_surv)
+survminer::ggsurvplot(fit,
+                      xlab = "Sample Collection to Recurrence (Months)",
+                      ylab = "Probablity of RFS",
+                      risk.table = TRUE, combine = TRUE,
+                      break.time.by = 2,
+                      pval.size = 5,
+                      legend ='right', legend.title = "Urine",
+                      legend.labs = c("ctDNA-", "ctDNA+"),
+                      palette = c("#6184D8", "#D29A22"),
+                      title = "")
+```
+
+# Pre-Surgery pCR Analysis
+## Patient Characteristic
+```{r}
+df_pcr |>
+  dplyr::mutate_at(c("tstage", "tstage_surgery"), forcats::fct_drop)  |>
+  dplyr::mutate(cancer_type = as.character(cancer_type)) |>
+  gtsummary::tbl_strata(
+    strata = biobank,
+    .tbl_fun = ~ .x |>
+      gtsummary::tbl_summary(
+        by = cancer_type,
+        include = c(sex, age, had_neoadjuvant_therapy, pcr_status, tstage, tstage_surgery),
+        label = list(sex = "Sex", age = "Age",
+                     had_neoadjuvant_therapy = "Received NAC",
+                     pcr_status = "pCR Status",
+                     tstage = "T stage at Diagnosis",
+                     tstage_surgery = "T Stage at Surgery")
+      )
+  ) |>
+  gtsummary::modify_caption("**Patient Characteristic of Pre-Surgery Sample Cohort**")
+```
+
+## Performance in predicting pCR
+```{r table_pcr_performance}
+c("Overall", "UCSD", "MGB") |>
+  purrr::map(function(subset) {
+    c("Urine", "Plasma", "Urine|Plasma") |>
+      purrr::map(function(biofluid) {
+        df_perf_eval <- df_pcr
+        if (subset != "Overall") {
+          df_perf_eval <- df_pcr |>
+            dplyr::filter(biobank == subset)
+        }
+        binary_col <- ifelse(biofluid == "Urine", "cancer_detected_urine",
+                             ifelse(biofluid == "Plasma", "cancer_detected_plasma",
+                                    "cancer_detected_urine_or_plasma"))
+        df_perf_eval |>
+          summarise_pcr_perf(binary_col = binary_col) |>
+          dplyr::mutate(Cohort = subset, Biofluid = biofluid)
+      }) |>
+      dplyr::bind_rows()
+  }) |>
+  dplyr::bind_rows() |>
+  dplyr::select(Cohort, Biofluid, Sensitivity:NPV) |>
+  gt::gt()
+
+df_pcr_mgb <- df_pcr |>
+  dplyr::filter(biobank == "MGB")
+CIfinder::ppv_npv_ci(
+  sum(df_pcr_mgb$pcr_status == "No-pCR" & df_pcr_mgb$cancer_detected_urine_or_plasma),
+  sum(df_pcr_mgb$pcr_status == "No-pCR"),
+  sum(df_pcr_mgb$pcr_status == "pCR" & (!df_pcr_mgb$cancer_detected_urine_or_plasma)),
+  sum(df_pcr_mgb$pcr_status == "pCR"),
+  1 - 0.36) |>
+  format_ppv_npv("MGB Pre-Surgery: PPV / NPV (assuming 36% pCR rate)")
+```
+
+## Tileplot {.tabset}
+```{r}
+tile_plot_pcr_analysis <- function(df) {
+  df |>
+    dplyr::arrange(pcr_status, tstage_surgery, tnm_surgery) |>
+    dplyr::mutate(id = forcats::fct_inorder(participant_id),
+                  tnm_surgery = ifelse(pcr_status == "pCR", NA_character_, tnm_surgery)) |>
+    ggplot2::ggplot() +
+    # Cancer type tile
+    ggplot2::geom_tile(ggplot2::aes(x = id, y = 4.5, fill = cancer_type), height = 0.5) +
+    ggplot2::scale_fill_manual("Cancer Type", values = c("MIBC" = "#D67500", "UTUC" = "#85B05B"),
+                               guide = ggplot2::guide_legend(order = 1)) +
+    ggnewscale::new_scale_fill() +
+    # Cancer type tile
+    ggplot2::geom_tile(ggplot2::aes(x = id, y = 4, fill = had_neoadjuvant_therapy), height = 0.5) +
+    ggplot2::scale_fill_manual("Neoadjuvant Chemo", guide = ggplot2::guide_legend(order = 2),
+                               values = c(`TRUE` = "#602B5B", `FALSE` = "#B68CB8"),
+                               labels = c(`TRUE` = "Received NAC", `FALSE` = "No NAC")) +
+    ggnewscale::new_scale_fill() +
+    # urine tiles
+    ggplot2::geom_tile(ggplot2::aes(x = id, y = 3, fill = cancer_detected_urine),
+                       color = "gray40") +
+    fill_urine_ctdna +
+    ggnewscale::new_scale_fill() +
+    # plasma ctDNA status
+    ggplot2::geom_tile(ggplot2::aes(x = id, y = 2, fill = cancer_detected_plasma),
+                       color = "gray40") +
+    fill_plasma_ctdna +
+    # Path stage text
+    ggplot2::geom_text(ggplot2::aes(x = id, y = 1.3, label = tnm_surgery),
+                       angle = 90, vjust = 0.5, hjust = 1, size = 2.5) +
+    ggplot2::scale_y_continuous(breaks = c(1, 2, 3, 4, 4.5),
+                                labels = c("Path Stage (RC)", "Plasma ctDNA", "Urine ctDNA",
+                                           "Received NAC", "Cancer Type")) +
+    ggplot2::coord_cartesian(clip = "off", ylim = c(5, 0)) +
+    ggplot2::facet_grid(cols = ggplot2::vars(pcr_status), scales = "free", space = "free") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank(), axis.ticks.x = ggplot2::element_blank(),
+                   axis.title.x = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
+                   axis.text.y = ggplot2::element_text(face = "bold"),
+                   axis.title.y = ggplot2::element_blank(),
+                   panel.grid = ggplot2::element_blank(),
+                   legend.position = "bottom", legend.direction = "vertical",
+                   legend.box.background = ggplot2::element_rect(color = "black", linewidth = 0.5),
+                   strip.background = ggh4x::element_part_rect(side = "b", color = "black"),
+                   strip.placement = "outside",
+                   strip.text = ggplot2::element_text(size = 12, face = "bold"))
+}
+```
+
+```{r figure_pcr_tile, fig.width = 13, fig.height = 3}
+(df_pcr |>
+   dplyr::filter(biobank == "UCSD") |>
+   tile_plot_pcr_analysis() +
+   ggplot2::labs(title = "UCSD (Pre-Surgery) Cohort") |
+ df_pcr |>
+   dplyr::filter(biobank == "MGB") |>
+   tile_plot_pcr_analysis() + ggplot2::theme(legend.position = "none") +
+   ggplot2::labs(title = "MGB (Pre-Surgery) Cohort")) +
+  patchwork::plot_layout(guides = "collect", widths = c(1, 3)) +
+  patchwork::plot_annotation(tag_levels = 'A')
+```
+
+# ROC
+```{r compute_roc_auc}
+# Helper: compute ROC curve points from a data.frame with response & cancer_score
+compute_roc_curves <- function(df, group_col = "cohort") {
+  df |>
+    dplyr::group_by(.data[[group_col]]) |>
+    dplyr::group_map(~{
+      roc_obj <- pROC::roc(response = .x$response, predictor = .x$cancer_score, direction = "<")
+      data.frame(cohort = .y[[group_col]][1], tpr = roc_obj$sensitivities,
+                 fpr = 1 - roc_obj$specificities)
+    }) |>
+    dplyr::bind_rows()
+}
+
+# Helper: compute AUC with CI from a data.frame with response & cancer_score
+compute_auc_table <- function(df, group_col = "cohort") {
+  df |>
+    dplyr::group_by(.data[[group_col]]) |>
+    dplyr::summarise(roc_obj = list(pROC::roc(response = response,
+                                              predictor = cancer_score, direction = "<")),
+                     N = dplyr::n(),
+                     N_actual_positive = sum(response),
+                     N_actual_negative = sum(!response),
+                     .groups = "drop") |>
+    dplyr::rename(cohort = !!group_col) |>
+    dplyr::mutate(auc = purrr::map_dbl(roc_obj, ~as.numeric(pROC::auc(.x))),
+                  auc_lci = purrr::map_dbl(roc_obj, ~as.numeric(pROC::ci.auc(.x))[1]),
+                  auc_uci = purrr::map_dbl(roc_obj, ~as.numeric(pROC::ci.auc(.x))[3]),
+                  label = sprintf("AUC = %.2f [%.2f-%.2f]", auc, auc_lci, auc_uci)) |>
+    dplyr::select(-roc_obj)
+}
+
+# --- Baseline ROC (cancer detection) ---
+df_roc_baseline_input <- df_baseline |>
+  dplyr::filter(biofluid == "urine", cohort != "UCSD Training") |>
+  dplyr::mutate(response = cancer_status == "Bladder Cancer/UTUC")
+
+df_roc <- compute_roc_curves(df_roc_baseline_input)
+df_auc <- compute_auc_table(df_roc_baseline_input) |>
+  dplyr::mutate(x_pos = 0.3, y_pos = 0.15)
+
+# --- Surveillance ROC (recurrence detection) ---
+df_roc_surv_input <- df_surv |>
+  dplyr::filter(!is.na(cancer_score), !is.na(recurrence_status_bsl)) |>
+  dplyr::mutate(response = recurrence_status_bsl == "Recurrence+",
+                cohort = "UCSD Holdout (Surveillance)")
+
+df_roc_surv <- compute_roc_curves(df_roc_surv_input)
+df_auc_surv <- compute_auc_table(df_roc_surv_input) |>
+  dplyr::mutate(x_pos = 0.3, y_pos = 0.15)
+
+# --- Pre-Surgery ROC (residual cancer / no-pCR detection, urine) ---
+df_roc_pcr_input <- df_pcr |>
+  dplyr::filter(!is.na(cancer_score_urine), !is.na(pcr_status)) |>
+  dplyr::mutate(response = pcr_status == "No-pCR",
+                cohort = "Pre-Surgery (Urine)",
+                cancer_score = cancer_score_urine)
+
+df_roc_pcr <- compute_roc_curves(df_roc_pcr_input)
+df_auc_pcr <- compute_auc_table(df_roc_pcr_input) |>
+  dplyr::mutate(x_pos = 0.3, y_pos = 0.15)
+```
+
+```{r figure_roc, fig.width = 11, fig.height = 4}
+dplyr::bind_rows(df_auc, df_auc_surv, df_auc_pcr) |>
+  dplyr::select(cohort, N_actual_positive, N_actual_negative, AUC = label) |>
+  gt::gt("AUC in each cohort")
+
+roc_base_layers <- list(
+  ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray"),
+  ggplot2::scale_x_continuous(breaks = seq(0, 1, 0.2)),
+  ggplot2::scale_y_continuous(breaks = seq(0, 1, 0.2)),
+  ggplot2::coord_fixed(ratio = 1),
+  ggplot2::labs(x = "False Positive Rate", y = "True Positive Rate"),
+  ggplot2::theme(legend.position = "inside", legend.position.inside = c(0.95, 0.5),
+                 legend.justification = c(1, 0),
+                 legend.background = ggplot2::element_rect(fill = "white", color = NA))
+)
+
+plt_roc_baseline <- df_roc |>
+  dplyr::arrange(cohort, fpr, tpr) |>
+  ggplot2::ggplot(ggplot2::aes(x = fpr, y = tpr, color = cohort)) +
+  ggplot2::geom_line(linewidth = 0.8, color = "#602B5B") +
+  ggplot2::geom_text(data = df_auc, ggplot2::aes(x = x_pos, y = y_pos, label = label),
+                     hjust = 0, size = 4, show.legend = FALSE, color = "#602B5B") +
+  roc_base_layers + cohort_color +
+  ggplot2::ggtitle("Baseline (Cancer Detection)")
+
+plt_roc_surv <- df_roc_surv |>
+  dplyr::arrange(cohort, fpr, tpr) |>
+  ggplot2::ggplot(ggplot2::aes(x = fpr, y = tpr)) +
+  ggplot2::geom_line(linewidth = 0.8, color = "#602B5B") +
+  ggplot2::geom_text(data = df_auc_surv, ggplot2::aes(x = x_pos, y = y_pos, label = label),
+                     hjust = 0, size = 4, color = "#602B5B") +
+  roc_base_layers +
+  ggplot2::ggtitle("Surveillance (Recurrence)")
+
+plt_roc_pcr <- df_roc_pcr |>
+  dplyr::arrange(cohort, fpr, tpr) |>
+  ggplot2::ggplot(ggplot2::aes(x = fpr, y = tpr)) +
+  ggplot2::geom_line(linewidth = 0.8, color = "#602B5B") +
+  ggplot2::geom_text(data = df_auc_pcr, ggplot2::aes(x = x_pos, y = y_pos, label = label),
+                     hjust = 0, size = 4, color = "#602B5B") +
+  roc_base_layers +
+  ggplot2::ggtitle("Pre-Surgery (Residual Cancer)")
+
+plt_roc_baseline + plt_roc_surv + plt_roc_pcr +
+  patchwork::plot_annotation(tag_levels = 'A') +
+  patchwork::plot_layout(nrow = 1)
+```
+
+# Reproducibility {.tabset}
+## Parameters
+```{r report_params}
+data.frame(parameter = names(params), value = as.character(params)) |>
+  gt::gt(caption = "Report parameters")
+```
+
+## Session info
+```{r session_info}
+pander::pander(sessionInfo())
+```
+
+## Build state
+```{r build_state}
+data.frame(
+  field = c("R version", "Platform", "Run date", "Working directory"),
+  value = c(R.version.string, R.version$platform,
+            format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), getwd())
+) |> gt::gt()
+```
